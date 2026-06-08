@@ -1,24 +1,88 @@
 "use client";
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, CartesianGrid, Area, AreaChart } from "recharts";
 
-const fmt = (n) => {
-  if (n >= 1000000) return `$${(n / 1000000).toFixed(2)}M`;
-  if (n >= 1000) return `$${(n / 1000).toFixed(0)}K`;
-  return `$${n.toFixed(0)}`;
-};
+// ── Aggregation logic (runs client-side when date filter changes) ──
+function aggregateRows(rows) {
+  const num = (v) => (v && v !== "NULL" && v !== "" ? parseFloat(v) || 0 : 0);
+  const rd = (v) => Math.round(v);
 
+  const activeRfqStatuses = ["Dispatched", "Accepted", "Booked"];
+  const activeOrderStatuses = ["Completed", "Billing", "Reservation", "Transport", "Negotiation"];
+
+  // RFQ data (all rows)
+  const totalRfq = rows.length;
+  const rfqBreakdown = {};
+  rows.forEach((r) => { rfqBreakdown[r.rfq_status] = (rfqBreakdown[r.rfq_status] || 0) + 1; });
+  const colorMap = { Dispatched: "#34d399", Expired: "#fbbf24", Cancelled: "#fb7185", Aborted: "#f97316", Accepted: "#22d3ee", Declined: "#ef4444", "Pending Cancellation": "#94a3b8", Booked: "#a78bfa", Revised: "#64748b" };
+  const rfqAll = Object.entries(rfqBreakdown).sort((a, b) => b[1] - a[1]).map(([name, value]) => ({
+    name: name === "Pending Cancellation" ? "Pending Cancel" : name, value, color: colorMap[name] || "#64748b",
+  }));
+  const activeRfqCount = rows.filter((r) => activeRfqStatuses.includes(r.rfq_status)).length;
+  const nonActiveCount = totalRfq - activeRfqCount;
+  const acceptanceRate = totalRfq > 0 ? ((activeRfqCount / totalRfq) * 100).toFixed(1) : "0.0";
+  const lostRevenue = rd(rows.filter((r) => !activeRfqStatuses.includes(r.rfq_status)).reduce((s, r) => s + num(r.revenue_cad), 0));
+
+  // Active orders
+  const active = rows.filter((r) => activeRfqStatuses.includes(r.rfq_status) && activeOrderStatuses.includes(r.order_status));
+  const totalRevenue = rd(active.reduce((s, r) => s + num(r.revenue_cad), 0));
+  const totalCost = rd(active.reduce((s, r) => s + num(r.lazr_cost_cad), 0));
+  const totalProfit = rd(active.reduce((s, r) => s + num(r.lazr_net_profit_cad), 0));
+  const totalOrders = active.length;
+
+  // Monthly
+  const mn = { "01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr", "05": "May", "06": "Jun", "07": "Jul", "08": "Aug", "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec" };
+  const byMonth = {};
+  active.forEach((r) => { const m = r.order_created.substring(0, 7); if (!byMonth[m]) byMonth[m] = { o: 0, r: 0, p: 0 }; byMonth[m].o++; byMonth[m].r += num(r.revenue_cad); byMonth[m].p += num(r.lazr_net_profit_cad); });
+  const monthly = Object.keys(byMonth).sort().map((k) => ({ month: `${mn[k.substring(5, 7)]} ${k.substring(2, 4)}`, orders: byMonth[k].o, revenue: rd(byMonth[k].r), profit: rd(byMonth[k].p) }));
+
+  // Order status
+  const bySt = {};
+  active.forEach((r) => { if (!bySt[r.order_status]) bySt[r.order_status] = { name: r.order_status, value: 0, revenue: 0 }; bySt[r.order_status].value++; bySt[r.order_status].revenue += num(r.revenue_cad); });
+  const orderStatus = Object.values(bySt).sort((a, b) => b.value - a.value).map((s) => ({ ...s, revenue: rd(s.revenue) }));
+
+  // Top clients
+  const byCl = {};
+  active.forEach((r) => { if (!byCl[r.client]) byCl[r.client] = { name: r.client, orders: 0, revenue: 0 }; byCl[r.client].orders++; byCl[r.client].revenue += num(r.revenue_cad); });
+  const topClients = Object.values(byCl).sort((a, b) => b.revenue - a.revenue).slice(0, 10).map((c) => ({ ...c, name: c.name.length > 18 ? c.name.substring(0, 16) + "…" : c.name, revenue: rd(c.revenue) }));
+
+  // Lane type
+  const byLane = {};
+  active.forEach((r) => { const k = r.lane_type; if (k === "NULL" || !k) return; if (!byLane[k]) byLane[k] = { name: k, orders: 0, revenue: 0 }; byLane[k].orders++; byLane[k].revenue += num(r.revenue_cad); });
+  const laneType = Object.values(byLane).sort((a, b) => b.revenue - a.revenue).map((l) => ({ ...l, revenue: rd(l.revenue) }));
+
+  // Sales reps
+  const byRep = {};
+  active.forEach((r) => { const k = r.sales_rep; if (!k || k === "NULL") return; const parts = k.split(/\s+/); const short = parts.length >= 2 ? parts[0] + " " + parts[parts.length - 1].charAt(0) + "." : k; if (!byRep[k]) byRep[k] = { name: short, orders: 0, revenue: 0 }; byRep[k].orders++; byRep[k].revenue += num(r.revenue_cad); });
+  const salesReps = Object.values(byRep).sort((a, b) => b.revenue - a.revenue).slice(0, 6).map((r) => ({ ...r, revenue: rd(r.revenue) }));
+
+  // Transport type
+  const byTr = {};
+  active.forEach((r) => { if (!byTr[r.transport_type]) byTr[r.transport_type] = { name: r.transport_type, orders: 0, revenue: 0 }; byTr[r.transport_type].orders++; byTr[r.transport_type].revenue += num(r.revenue_cad); });
+  const transportType = Object.values(byTr).sort((a, b) => b.revenue - a.revenue).map((t) => ({ ...t, revenue: rd(t.revenue) }));
+
+  // Agent data
+  const byAgent = {};
+  rows.forEach((r) => { const agent = (r.three_pl_agent_name || "").trim(); if (!agent) return; if (!byAgent[agent]) byAgent[agent] = { orders: 0, times: [], revenue: 0, active: 0 }; byAgent[agent].orders++; const t = num(r.time_to_quote_minutes); if (t > 0) byAgent[agent].times.push(t); byAgent[agent].revenue += num(r.revenue_cad); if (activeRfqStatuses.includes(r.rfq_status)) byAgent[agent].active++; });
+  const agentData = Object.entries(byAgent).sort((a, b) => b[1].orders - a[1].orders).slice(0, 15).map(([name, d]) => {
+    const times = d.times.sort((a, b) => a - b);
+    const median = times.length > 0 ? times[Math.floor(times.length / 2)] : 0;
+    const avg = times.length > 0 ? times.reduce((s, t) => s + t, 0) / times.length : 0;
+    return { name: name.length > 20 ? name.substring(0, 18) + "." : name, orders: d.orders, avgTime: parseFloat(avg.toFixed(1)), medianTime: parseFloat(median.toFixed(1)), revenue: rd(d.revenue), acceptance: d.orders > 0 ? parseFloat(((d.active / d.orders) * 100).toFixed(1)) : 0 };
+  });
+
+  return { totalRevenue, totalCost, totalProfit, totalOrders, monthly, orderStatus, topClients, laneType, salesReps, transportType, rfqAll, totalRfq, activeRfqCount, nonActiveCount, acceptanceRate, lostRevenue, agentData };
+}
+
+// ── Formatting helpers ──
+const fmt = (n) => { if (n >= 1000000) return `$${(n / 1000000).toFixed(2)}M`; if (n >= 1000) return `$${(n / 1000).toFixed(0)}K`; return `$${n.toFixed(0)}`; };
 const fmtFull = (n) => `$${n.toLocaleString("en-CA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
-const C = {
-  bg: "#0a0e17", surface: "#0f1525", border: "#1a2540", text: "#e2e8f0", textMuted: "#64748b",
-  green: "#34d399", greenDim: "rgba(52,211,153,0.12)", greenBright: "#6ee7b7",
-  emerald: "#10b981", teal: "#14b8a6", cyan: "#22d3ee",
-  amber: "#fbbf24", rose: "#fb7185", purple: "#a78bfa", orange: "#f97316",
-};
-
+// ── Theme ──
+const C = { bg: "#0a0e17", surface: "#0f1525", border: "#1a2540", text: "#e2e8f0", textMuted: "#64748b", green: "#34d399", greenDim: "rgba(52,211,153,0.12)", teal: "#14b8a6", cyan: "#22d3ee", amber: "#fbbf24", rose: "#fb7185", purple: "#a78bfa", orange: "#f97316" };
 const PIE_COLORS = [C.green, C.teal, C.amber, C.rose, C.purple];
 
+// ── Reusable components (unchanged) ──
 const KPICard = ({ label, value, sub, color, icon }) => (
   <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 16, padding: "24px 28px", position: "relative", overflow: "hidden", minWidth: 0 }}>
     <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3, background: `linear-gradient(90deg, ${color}, transparent)` }} />
@@ -50,9 +114,7 @@ const CustomTooltip = ({ active, payload, label }) => {
       {payload.map((p, i) => (
         <div key={i} style={{ fontSize: 11, color: p.color, display: "flex", gap: 8, justifyContent: "space-between" }}>
           <span>{p.name}</span>
-          <span style={{ fontWeight: 600, fontFamily: "'JetBrains Mono', monospace" }}>
-            {p.name === "Orders" ? p.value : fmtFull(p.value)}
-          </span>
+          <span style={{ fontWeight: 600, fontFamily: "'JetBrains Mono', monospace" }}>{p.name === "Orders" ? p.value : fmtFull(p.value)}</span>
         </div>
       ))}
     </div>
@@ -61,18 +123,72 @@ const CustomTooltip = ({ active, payload, label }) => {
 
 const tabs = ["Overview", "Clients & Lanes", "Acceptance Rate", "Agent Performance"];
 
-export default function Dashboard({ data }) {
-  const [activeTab, setActiveTab] = useState("Overview");
+// ── Quick-select presets ──
+function getPresetDates(preset) {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  switch (preset) {
+    case "ytd": return { from: `${y}-01-01`, to: "" };
+    case "q1": return { from: `${y}-01-01`, to: `${y}-03-31` };
+    case "q2": return { from: `${y}-04-01`, to: `${y}-06-30` };
+    case "q3": return { from: `${y}-07-01`, to: `${y}-09-30` };
+    case "q4": return { from: `${y}-10-01`, to: `${y}-12-31` };
+    case "last30": { const d = new Date(now); d.setDate(d.getDate() - 30); return { from: d.toISOString().slice(0, 10), to: "" }; }
+    case "last90": { const d = new Date(now); d.setDate(d.getDate() - 90); return { from: d.toISOString().slice(0, 10), to: "" }; }
+    case "lastMonth": { const first = new Date(y, m - 1, 1); const last = new Date(y, m, 0); return { from: first.toISOString().slice(0, 10), to: last.toISOString().slice(0, 10) }; }
+    case "all": default: return { from: "", to: "" };
+  }
+}
 
-  const {
-    totalRevenue, totalCost, totalProfit, totalOrders,
-    monthly: MONTHLY, orderStatus: ORDER_STATUS,
-    topClients: TOP_CLIENTS, laneType: LANE_TYPE, salesReps: SALES_REPS,
-    transportType: TRANSPORT_TYPE, rfqAll: RFQ_ALL,
-    totalRfq, activeRfqCount, nonActiveCount, acceptanceRate, lostRevenue,
-    agentData: AGENT_DATA,
-  } = data;
-  const margin = ((totalProfit / totalRevenue) * 100).toFixed(1);
+// ── Main Dashboard ──
+export default function Dashboard({ rawRows }) {
+  const [activeTab, setActiveTab] = useState("Overview");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [activePreset, setActivePreset] = useState("all");
+
+  // Filter rows by date range
+  const filteredRows = useMemo(() => {
+    if (!dateFrom && !dateTo) return rawRows;
+    return rawRows.filter((r) => {
+      const d = r.order_created.substring(0, 10);
+      if (dateFrom && d < dateFrom) return false;
+      if (dateTo && d > dateTo) return false;
+      return true;
+    });
+  }, [rawRows, dateFrom, dateTo]);
+
+  // Aggregate filtered data
+  const data = useMemo(() => aggregateRows(filteredRows), [filteredRows]);
+
+  const { totalRevenue, totalCost, totalProfit, totalOrders, monthly: MONTHLY, orderStatus: ORDER_STATUS, topClients: TOP_CLIENTS, laneType: LANE_TYPE, salesReps: SALES_REPS, transportType: TRANSPORT_TYPE, rfqAll: RFQ_ALL, totalRfq, activeRfqCount, nonActiveCount, acceptanceRate, lostRevenue, agentData: AGENT_DATA } = data;
+  const margin = totalRevenue > 0 ? ((totalProfit / totalRevenue) * 100).toFixed(1) : "0.0";
+
+  const handlePreset = (preset) => {
+    setActivePreset(preset);
+    const { from, to } = getPresetDates(preset);
+    setDateFrom(from);
+    setDateTo(to);
+  };
+
+  const handleDateChange = (field, value) => {
+    setActivePreset("custom");
+    if (field === "from") setDateFrom(value);
+    else setDateTo(value);
+  };
+
+  const presets = [
+    { key: "all", label: "All Data" },
+    { key: "ytd", label: "YTD" },
+    { key: "q1", label: "Q1" },
+    { key: "q2", label: "Q2" },
+    { key: "q3", label: "Q3" },
+    { key: "q4", label: "Q4" },
+    { key: "last30", label: "Last 30d" },
+    { key: "last90", label: "Last 90d" },
+    { key: "lastMonth", label: "Last Month" },
+  ];
 
   return (
     <div style={{ background: C.bg, minHeight: "100vh", color: C.text, fontFamily: "'DM Sans', 'Segoe UI', sans-serif", padding: "0 0 60px" }}>
@@ -87,7 +203,7 @@ export default function Dashboard({ data }) {
             <span style={{ fontSize: 22, fontWeight: 400, color: C.textMuted, marginLeft: 8 }}>Quote Analysis</span>
           </div>
         </div>
-        <div style={{ fontSize: 13, color: C.textMuted, marginLeft: 52 }}>3PL Operations · 2025 YTD · Revenue & Profitability Dashboard</div>
+        <div style={{ fontSize: 13, color: C.textMuted, marginLeft: 52 }}>3PL Operations · Revenue & Profitability Dashboard</div>
 
         <div style={{ display: "flex", gap: 4, marginTop: 20, marginLeft: 52 }}>
           {tabs.map(t => (
@@ -101,8 +217,52 @@ export default function Dashboard({ data }) {
       </div>
 
       <div style={{ maxWidth: 1200, margin: "0 auto", padding: "0 32px" }}>
+
+        {/* ── DATE FILTER BAR ── */}
+        <div style={{
+          marginTop: 20, padding: "16px 24px", background: C.surface, border: `1px solid ${C.border}`,
+          borderRadius: 14, display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 13, fontWeight: 600, color: C.green, textTransform: "uppercase", letterSpacing: 1 }}>📅 Period</span>
+          </div>
+
+          {/* Quick presets */}
+          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+            {presets.map(p => (
+              <button key={p.key} onClick={() => handlePreset(p.key)} style={{
+                padding: "6px 14px", borderRadius: 6, border: "none", cursor: "pointer",
+                fontSize: 12, fontWeight: 600, transition: "all 0.15s",
+                background: activePreset === p.key ? C.greenDim : "rgba(255,255,255,0.04)",
+                color: activePreset === p.key ? C.green : C.textMuted,
+              }}>{p.label}</button>
+            ))}
+          </div>
+
+          {/* Custom date inputs */}
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
+            <span style={{ fontSize: 11, color: C.textMuted }}>From</span>
+            <input type="date" value={dateFrom} onChange={(e) => handleDateChange("from", e.target.value)} style={{
+              padding: "6px 10px", borderRadius: 6, border: `1px solid ${C.border}`,
+              background: "#0a0e17", color: C.text, fontSize: 12, fontFamily: "'JetBrains Mono', monospace",
+              outline: "none",
+            }} />
+            <span style={{ fontSize: 11, color: C.textMuted }}>To</span>
+            <input type="date" value={dateTo} onChange={(e) => handleDateChange("to", e.target.value)} style={{
+              padding: "6px 10px", borderRadius: 6, border: `1px solid ${C.border}`,
+              background: "#0a0e17", color: C.text, fontSize: 12, fontFamily: "'JetBrains Mono', monospace",
+              outline: "none",
+            }} />
+          </div>
+
+          {/* Row count indicator */}
+          <div style={{ fontSize: 11, color: C.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
+            {filteredRows.length.toLocaleString()} / {rawRows.length.toLocaleString()} quotes
+          </div>
+        </div>
+
         {/* KPIs */}
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 16, marginTop: 28 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 16, marginTop: 16 }}>
           <KPICard icon="💰" label="Total Revenue" value={fmt(totalRevenue)} sub={fmtFull(totalRevenue) + " CAD"} color={C.green} />
           <KPICard icon="📊" label="Total Cost" value={fmt(totalCost)} sub={fmtFull(totalCost) + " CAD"} color={C.amber} />
           <KPICard icon="✅" label="Net Profit" value={fmt(totalProfit)} sub={`${margin}% margin`} color={C.teal} />
@@ -155,7 +315,7 @@ export default function Dashboard({ data }) {
                 </PieChart>
               </ResponsiveContainer>
               <div style={{ display: "flex", gap: 24, justifyContent: "center", marginTop: 8 }}>
-                {TRANSPORT_TYPE.map((t, i) => (<div key={t.name} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}><div style={{ width: 12, height: 12, borderRadius: 3, background: i === 0 ? C.green : C.amber }} /><span style={{ color: C.textMuted }}>{t.name}</span><span style={{ fontWeight: 700, fontFamily: "'JetBrains Mono', monospace" }}>{t.orders}</span><span style={{ color: C.textMuted, fontSize: 11 }}>({((t.orders / totalOrders) * 100).toFixed(0)}%)</span></div>))}
+                {TRANSPORT_TYPE.map((t, i) => (<div key={t.name} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}><div style={{ width: 12, height: 12, borderRadius: 3, background: i === 0 ? C.green : C.amber }} /><span style={{ color: C.textMuted }}>{t.name}</span><span style={{ fontWeight: 700, fontFamily: "'JetBrains Mono', monospace" }}>{t.orders}</span><span style={{ color: C.textMuted, fontSize: 11 }}>({totalOrders > 0 ? ((t.orders / totalOrders) * 100).toFixed(0) : 0}%)</span></div>))}
               </div>
             </ChartCard>
           </div>
@@ -231,8 +391,8 @@ export default function Dashboard({ data }) {
                     <td style={{ padding: "12px 20px", fontFamily: "'JetBrains Mono', monospace" }}>{fmtFull(c.revenue)}</td>
                     <td style={{ padding: "12px 20px" }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <div style={{ flex: 1, height: 6, borderRadius: 3, background: C.border }}><div style={{ height: "100%", borderRadius: 3, background: C.green, width: `${(c.revenue / totalRevenue) * 100}%` }} /></div>
-                        <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, minWidth: 40, textAlign: "right" }}>{((c.revenue / totalRevenue) * 100).toFixed(1)}%</span>
+                        <div style={{ flex: 1, height: 6, borderRadius: 3, background: C.border }}><div style={{ height: "100%", borderRadius: 3, background: C.green, width: `${totalRevenue > 0 ? (c.revenue / totalRevenue) * 100 : 0}%` }} /></div>
+                        <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, minWidth: 40, textAlign: "right" }}>{totalRevenue > 0 ? ((c.revenue / totalRevenue) * 100).toFixed(1) : "0.0"}%</span>
                       </div>
                     </td>
                   </tr>
@@ -260,7 +420,7 @@ export default function Dashboard({ data }) {
                   <Pie data={RFQ_ALL} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={60} outerRadius={110} paddingAngle={2} strokeWidth={0}>
                     {RFQ_ALL.map((entry, i) => <Cell key={i} fill={entry.color} />)}
                   </Pie>
-                  <Tooltip content={({ active, payload }) => { if (!active || !payload?.length) return null; const d = payload[0].payload; return (<div style={{ background: "#152035", border: `1px solid ${C.border}`, borderRadius: 10, padding: "10px 14px" }}><div style={{ fontWeight: 600, fontSize: 13, color: C.text }}>{d.name}</div><div style={{ fontSize: 11, color: C.textMuted }}>{d.value} quotes · {(d.value / totalRfq * 100).toFixed(1)}%</div></div>); }} />
+                  <Tooltip content={({ active, payload }) => { if (!active || !payload?.length) return null; const d = payload[0].payload; return (<div style={{ background: "#152035", border: `1px solid ${C.border}`, borderRadius: 10, padding: "10px 14px" }}><div style={{ fontWeight: 600, fontSize: 13, color: C.text }}>{d.name}</div><div style={{ fontSize: 11, color: C.textMuted }}>{d.value} quotes · {totalRfq > 0 ? (d.value / totalRfq * 100).toFixed(1) : 0}%</div></div>); }} />
                 </PieChart>
               </ResponsiveContainer>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 10, justifyContent: "center", marginTop: 8 }}>
@@ -387,7 +547,7 @@ export default function Dashboard({ data }) {
 
         {/* Footer */}
         <div style={{ marginTop: 48, padding: "20px 0", borderTop: `1px solid ${C.border}`, textAlign: "center" }}>
-          <span style={{ fontSize: 11, color: C.textMuted }}>Synergie Canada · Custom Quote Analysis · 2025 YTD · All amounts in CAD unless noted</span>
+          <span style={{ fontSize: 11, color: C.textMuted }}>Synergie Canada · Custom Quote Analysis · All amounts in CAD unless noted</span>
         </div>
       </div>
     </div>
